@@ -3,14 +3,15 @@ flask>=3.0.0
 
 # ---- TFLite runtime – choose ONE of the following blocks.
 #
-# Option A (recommended): lightweight standalone runtime, no GPU, small image
+# Option A (recommended): lightweight standalone runtime (~2 MB), no GPU
 #   Works on Python 3.9-3.12, x86-64 and arm64.
-#   Uncomment the line below and comment out Option B.
+tflite-runtime>=2.13.0
 #
+# Option B (alternative): newer Google edge runtime
 # ai-edge-litert>=1.0.1
 #
-# Option B: full TensorFlow CPU build (always up-to-date, larger ~400 MB)
-tensorflow-cpu>=2.14.0
+# Option C (fallback): full TensorFlow CPU build (larger ~400 MB, Python version restrictions)
+# tensorflow-cpu>=2.13.0
 
 # Image processing
 Pillow>=10.0.0
