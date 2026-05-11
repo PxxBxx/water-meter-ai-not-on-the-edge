@@ -15,7 +15,7 @@ tflite-runtime>=2.13.0
 
 # Image processing
 Pillow>=10.0.0
-numpy>=1.24.0
+numpy>=1.24.0,<2          # NumPy 2.x breaks tflite-runtime; pin to 1.x
 
 # Alignment (strongly recommended – without it only coarse rotation is applied)
 opencv-python-headless>=4.8.0
