@@ -1,0 +1,20 @@
+# ---- Setup wizard --------------------------------------------------------
+flask>=3.0.0
+
+# ---- TFLite runtime – choose ONE of the following blocks.
+#
+# Option A (recommended): lightweight standalone runtime, no GPU, small image
+#   Works on Python 3.9-3.12, x86-64 and arm64.
+#   Uncomment the line below and comment out Option B.
+#
+# ai-edge-litert>=1.0.1
+#
+# Option B: full TensorFlow CPU build (always up-to-date, larger ~400 MB)
+tensorflow-cpu>=2.14.0
+
+# Image processing
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Alignment (strongly recommended – without it only coarse rotation is applied)
+opencv-python-headless>=4.8.0

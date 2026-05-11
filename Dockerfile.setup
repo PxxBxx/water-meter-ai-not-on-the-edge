@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# meter-reader setup wizard – browser-based configuration tool
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY setup_wizard.py .
+COPY meter_reader.py .
+
+# /sdcard is bind-mounted from the host.  The wizard saves config there.
+VOLUME ["/sdcard"]
+
+EXPOSE 5000
+
+ENTRYPOINT ["python", "/app/setup_wizard.py"]
+CMD ["--sdcard", "/sdcard", "--host", "0.0.0.0", "--port", "5000"]

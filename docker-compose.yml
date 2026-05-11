@@ -1,0 +1,32 @@
+services:
+  # ── One-shot meter reading ──────────────────────────────────────────────
+  meter-reader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meter-reader:latest
+    volumes:
+      # Bind-mount your sdcard directory (read-only)
+      - ./sdcard:/sdcard:ro
+      # Bind-mount the folder that contains your input images (read-only)
+      - ./images:/images:ro
+      # Optional: write debug images here
+      - ./debug:/debug
+    # Override command for a one-shot reading:
+    #   docker compose run --rm meter-reader --image /images/meter.jpg --pretty
+    command: ["--help"]
+
+  # ── Browser-based setup wizard ──────────────────────────────────────────
+  # Run:  docker compose up setup-wizard
+  # Then open http://localhost:5000
+  setup-wizard:
+    build:
+      context: .
+      dockerfile: Dockerfile.setup
+    image: meter-reader-setup:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      # sdcard is writable – the wizard saves config.ini and ref images here
+      - ./sdcard:/sdcard
+    restart: "no"
