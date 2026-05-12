@@ -106,6 +106,25 @@ pip install -r requirements.txt
 
 **Note:** If you have issues with TFLite, edit `requirements.txt` to comment out the default choice and uncomment an alternative (see file comments).
 
+### Obtaining Pre-trained Models
+
+This repository **does not include** the pre-trained TFLite model files (`.tflite`). They are maintained by the [jomjol/AI-on-the-edge-device](https://github.com/jomjol/AI-on-the-edge-device) project.
+
+**To get the models:**
+1. Clone or visit the [AI-on-the-edge-device repository](https://github.com/jomjol/AI-on-the-edge-device)
+2. Download the models from [`sd-card/config/`](https://github.com/jomjol/AI-on-the-edge-device/tree/master/sd-card/config)
+3. Copy them to your local `sdcard/config/` directory (create it if it doesn't exist)
+
+Example:
+```bash
+# Download a few common models
+wget -P sdcard/config/ \
+  https://raw.githubusercontent.com/jomjol/AI-on-the-edge-device/master/sd-card/config/dig-cont_0900_s3_q.tflite \
+  https://raw.githubusercontent.com/jomjol/AI-on-the-edge-device/master/sd-card/config/ana-cont_1500_s2_q.tflite
+```
+
+See the [original project documentation](https://github.com/jomjol/AI-on-the-edge-device) for a complete list of available models.
+
 ---
 
 ## Workflow
@@ -313,6 +332,8 @@ python meter_reader.py \
 ---
 
 ## Models & Inference
+
+> **⚠️ Note on TFLite Models:** Pre-trained `.tflite` model files are **not included** in this repository. They are the property of the [jomjol/AI-on-the-edge-device](https://github.com/jomjol/AI-on-the-edge-device) project. You can obtain them from the [official repository's sd-card/config/ directory](https://github.com/jomjol/AI-on-the-edge-device/tree/master/sd-card/config). Copy the desired `.tflite` models to your local `sdcard/config/` directory before running meter_reader.py.
 
 ### Supported Model Types
 
