@@ -11,11 +11,11 @@ Publishes water meter readings from meter_reader.py to Home Assistant via MQTT.
 4. Publishes the reading to Home Assistant
 
 Requirements:
-    pip install paho-mqtt requests
+    pip install paho-mqtt
 
 Configuration:
-    Edit the MQTT_BROKER, HA_IP, IMAGE_URL, SDCARD_DIR, and METER_READER_SCRIPT
-    variables below, or pass them as environment variables.
+    Edit MQTT_BROKER, IMAGE_URL, SDCARD_DIR, and METER_READER_SCRIPT below,
+    or set via environment variables.
 """
 
 import argparse
@@ -41,12 +41,11 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 # Home Assistant MQTT Discovery
 HA_DISCOVERY_PREFIX = os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")
 DEVICE_ID = "water_meter"
-ENTITY_UNIQUE_ID = "water_meter_total"
 
 # Topics
-STATE_TOPIC = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{ENTITY_UNIQUE_ID}/state"
-CONFIG_TOPIC = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{ENTITY_UNIQUE_ID}/config"
-AVAILABILITY_TOPIC = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{ENTITY_UNIQUE_ID}/availability"
+STATE_TOPIC = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/state"
+CONFIG_TOPIC = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/config"
+AVAILABILITY_TOPIC = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/availability"
 
 # Image source
 IMAGE_URL = os.getenv(
@@ -76,15 +75,13 @@ def get_config_payload() -> dict:
     """Build the Home Assistant MQTT Discovery config payload."""
     return {
         "name": "Water Meter",
-        "unique_id": ENTITY_UNIQUE_ID,
+        "unique_id": DEVICE_ID,
         "state_topic": STATE_TOPIC,
         "availability_topic": AVAILABILITY_TOPIC,
         "unit_of_measurement": "m³",
         "device_class": "water",
         "state_class": "total_increasing",
-        "value_template": "{{ value_json.value }}",
-        "json_attributes_topic": STATE_TOPIC,
-        "json_attributes_template": "{{ value_json | tojson }}",
+        "value_template": "{{ value }}",
         "device": {
             "identifiers": [DEVICE_ID],
             "name": "Water Meter",
@@ -112,17 +109,12 @@ def on_disconnect(client, disconnect_flags, auth_data, rc, properties=None):
         logger.warning(f"Unexpected disconnection: rc={rc}")
 
 
-def publish_mqtt(client: mqtt.Client, topic: str, payload: dict, retain: bool = True) -> bool:
-    """Publish a JSON payload to MQTT."""
+def publish_mqtt(client: mqtt.Client, topic: str, payload: str, retain: bool = True) -> bool:
+    """Publish a payload to MQTT."""
     try:
-        msg_info = client.publish(
-            topic,
-            payload=json.dumps(payload),
-            qos=1,
-            retain=retain
-        )
+        msg_info = client.publish(topic, payload, qos=1, retain=retain)
         msg_info.wait_for_publish()
-        logger.info(f"Published to {topic}")
+        logger.info(f"Published to {topic}: {payload}")
         return True
     except Exception as e:
         logger.error(f"Failed to publish to {topic}: {e}")
@@ -256,21 +248,17 @@ def main() -> int:
 
         # Publish Home Assistant discovery config
         config_payload = get_config_payload()
-        publish_mqtt(client, CONFIG_TOPIC, config_payload, retain=True)
+        publish_mqtt(client, CONFIG_TOPIC, json.dumps(config_payload), retain=True)
 
         # Publish the meter reading(s)
         for group_name, group_data in reading.items():
             if isinstance(group_data, dict):
-                # Publish per-group (main, secondary, etc.)
-                state_payload = {
-                    "group": group_name,
-                    **group_data
-                }
-                publish_mqtt(client, STATE_TOPIC, state_payload, retain=True)
+                value = group_data.get("value")
+                error = group_data.get("error")
 
-                # Log success
-                if group_data.get("error") == "no error":
-                    value = group_data.get("value")
+                # Publish the value as the state (plain number)
+                if value is not None and error == "no error":
+                    publish_mqtt(client, STATE_TOPIC, str(value), retain=True)
                     confidence = group_data.get("confidence")
                     logger.info(
                         f"Published {group_name}: {value} m³ "
@@ -278,11 +266,11 @@ def main() -> int:
                     )
                 else:
                     logger.warning(
-                        f"Error reading {group_name}: {group_data.get('error')}"
+                        f"Error reading {group_name}: {error}"
                     )
 
         # Publish availability
-        publish_mqtt(client, AVAILABILITY_TOPIC, {"state": "online"})
+        publish_mqtt(client, AVAILABILITY_TOPIC, "online", retain=True)
 
         client.loop_stop()
         client.disconnect()
