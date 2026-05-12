@@ -263,6 +263,53 @@ ErrorMessage = true
 | `MaxRateValue` | Max change between consecutive readings |
 | `AnalogDigitTransitionStart` | Analog value (0-10) above which digit transition logic triggers |
 
+### Pre-Value Validation and Digit Correction
+
+The `PreValueUse` flag enables reading validation against a previous meter reading. This helps correct common OCR errors where a single digit is misread:
+
+**How it works:**
+
+1. **Enable in config.ini:**
+   ```ini
+   [PostProcessing]
+   PreValueUse = true
+   ```
+
+2. **Create `sdcard/config/prevalue.ini`** with the previous reading:
+   ```
+   2026-05-12_10-30-45
+   1957.17
+   ```
+   - Line 1: Timestamp (ISO format with underscores)
+   - Line 2: The previous meter value
+
+3. **Automatic correction:**
+   - If current reading is unreasonable (e.g., 1457.17 when previous was 1957.17), the reader tries substituting each digit
+   - Returns the alternative that makes sense based on typical usage patterns (-10 to +500 m³ daily)
+   - Includes a `"note"` field in JSON output explaining the correction
+
+**Example output with correction:**
+```json
+{
+  "main": {
+    "raw": "1457.17",
+    "value": "1957.17",
+    "error": "no error",
+    "note": "Corrected from 1457.17 based on previous reading 1957.17",
+    "confidence": [0.95, 0.87, 0.92]
+  }
+}
+```
+
+**Usage:**
+```bash
+python meter_reader.py \
+  --image meter.jpg \
+  --sdcard ./sdcard \
+  --prevalue ./sdcard/config/prevalue.ini \
+  --pretty
+```
+
 ---
 
 ## Models & Inference
@@ -278,6 +325,42 @@ Auto-detected from model output shape:
 | **DoubleHybrid10** | 10 | Softmax + neighbour weighting → 0-10 float | Hybrid digit/analog (10 classes + sub-integer) |
 | **Digit100** | 100 | argmax / 10 → float | Fine-grained digit (0.0-10.0) |
 | **Analogue100** | 100 | Same formula as Digit100 | Analog gauges |
+
+### Confidence Values
+
+Each digit/ROI includes a confidence score from the model:
+
+- **Digit models**: Output value at the predicted class (0.0-1.0)
+- **Analogue models**: Magnitude of the signal vector (strength of needle position)
+- **DoubleHybrid10**: Sum of best and adjacent class outputs (fit value)
+- **Digit100/Analogue100**: Output value at argmax
+
+**Usage in Home Assistant:**
+
+The `confidence` array in the JSON output tracks confidence for each digit:
+```json
+{
+  "main": {
+    "raw": "056.4321",
+    "value": "56.4321",
+    "error": "no error",
+    "confidence": [0.95, 0.87, 0.92, 0.91, 0.88]
+  }
+}
+```
+
+Home Assistant automatically includes these in the sensor attributes. Create templates to alert on low confidence:
+```yaml
+automation:
+  - alias: "Alert on low meter confidence"
+    trigger:
+      platform: template
+      value_template: "{{ state_attr('sensor.water_meter', 'confidence') | list | min < 0.7 }}"
+    action:
+      service: notify.mobile_app_phone
+      data:
+        message: "⚠️ Water meter reading has low confidence ({{ state_attr('sensor.water_meter', 'confidence') }})"
+```
 
 ### Inference Details
 
@@ -335,10 +418,89 @@ python meter_reader.py --image IMAGE --sdcard DIR [options]
 - `--config PATH` – config.ini path (default: `<sdcard>/config/config.ini`)
 - `--debug-dir DIR` – save intermediate images for troubleshooting
 - `--pretty` – pretty-print JSON output
+- `--prevalue PATH` – path to prevalue.ini for validation against previous readings (default: `<sdcard>/config/prevalue.ini`)
 
 **Output:** JSON to stdout
 ```json
-{"sequence_name": {"raw": "value", "value": "clean_value", "error": "message"}, …}
+{"sequence_name": {"raw": "value", "value": "clean_value", "error": "message", "confidence": [0.95, 0.87, ...]}, …}
+```
+
+### Home Assistant Integration (`cron_ha.py`)
+
+**Purpose:** Automated Home Assistant MQTT integration – publishes meter readings directly to HA with MQTT Discovery.
+
+**CLI:**
+```bash
+python cron_ha.py [options]
+```
+
+**Options:**
+- `--image-url URL` – URL of the meter image (default: `http://web.lan/watermeter_images/latest.jpg`)
+- `--mqtt-broker HOST` – MQTT broker address (default: `192.168.1.10`)
+- `--mqtt-port PORT` – MQTT broker port (default: `1883`)
+- `--sdcard DIR` – root of sdcard tree (default: `./sdcard`)
+- `--meter-reader PATH` – path to meter_reader.py script
+- `--debug` – enable debug logging
+
+**Features:**
+- 🏠 **MQTT Discovery** – automatically creates water meter sensor in Home Assistant
+- 📷 **Image Download** – fetches the latest meter image from a web URL
+- 🔍 **Smart Reading** – runs meter_reader.py and extracts the value
+- 📊 **Full Attributes** – publishes raw reading, confidence values, and error messages
+- 🔄 **Cron-Friendly** – designed for scheduled execution (e.g., every 5 minutes)
+- 📝 **Logging** – comprehensive debug logging for troubleshooting
+
+**Configuration (environment variables):**
+```bash
+export MQTT_BROKER=192.168.1.10
+export MQTT_PORT=1883
+export MQTT_USERNAME=homeassistant
+export MQTT_PASSWORD=secret
+export IMAGE_URL=http://web.lan/watermeter_images/latest.jpg
+export SDCARD_DIR=./sdcard
+export HA_DISCOVERY_PREFIX=homeassistant
+python cron_ha.py
+```
+
+**MQTT Topics:**
+- **Config** (discovery): `homeassistant/sensor/water_meter_1/water_meter_total/config`
+- **State** (reading): `homeassistant/sensor/water_meter_1/water_meter_total/state`
+- **Availability**: `homeassistant/sensor/water_meter_1/water_meter_total/availability`
+
+**Home Assistant Output Example:**
+```json
+{
+  "name": "Water Meter",
+  "unique_id": "water_meter_total",
+  "state_topic": "homeassistant/sensor/water_meter_1/water_meter_total/state",
+  "unit_of_measurement": "m³",
+  "device_class": "water",
+  "state_class": "total_increasing",
+  "value_template": "{{ value_json.value }}",
+  "json_attributes_topic": "homeassistant/sensor/water_meter_1/water_meter_total/state",
+  "device": {
+    "identifiers": ["water_meter_1"],
+    "name": "Water Meter",
+    "manufacturer": "Custom",
+    "model": "DIY Analog Water Meter Reading"
+  }
+}
+```
+
+**State Payload:**
+```json
+{
+  "group": "main",
+  "raw": "056.4321",
+  "value": "56.4321",
+  "error": "no error",
+  "confidence": [0.95, 0.87, 0.92]
+}
+```
+
+**Requirements:**
+```bash
+pip install paho-mqtt requests
 ```
 
 ---
@@ -376,7 +538,7 @@ docker compose run --rm meter-reader \
 # }
 ```
 
-### Example 2: Python Bare-Metal
+### Example 5: Python Bare-Metal
 
 ```bash
 # Setup
@@ -400,7 +562,149 @@ open /tmp/meter-debug/aligned.jpg
 ls /tmp/meter-debug/digit_*.jpg
 ```
 
-### Example 3: Integration with Home Assistant / InfluxDB
+### Example 3: Home Assistant Integration (cron_ha.py)
+
+**Setup:**
+
+1. **Install dependencies:**
+   ```bash
+   pip install paho-mqtt requests
+   ```
+
+2. **Configure your Home Assistant MQTT broker** (if not already done):
+   - In Home Assistant: Settings → Devices & Services → Create Automation or MQTT
+   - Ensure MQTT broker is running and accessible (default: port 1883)
+
+3. **Configure meter_reader.py** (if not already done):
+   ```bash
+   python setup_wizard.py --sdcard ./sdcard --port 5000
+   # Open http://localhost:5000 and complete the wizard
+   ```
+
+4. **Run once to test:**
+   ```bash
+   python cron_ha.py \
+     --image-url http://web.lan/watermeter_images/latest.jpg \
+     --mqtt-broker 192.168.1.10 \
+     --sdcard ./sdcard \
+     --debug
+   ```
+
+5. **Check Home Assistant:**
+   - Settings → Devices & Services → MQTT
+   - You should see a new "Water Meter" entity
+   - Check Entities list: `sensor.water_meter`
+
+**Automated scheduling (Cron):**
+
+Every 5 minutes:
+```bash
+*/5 * * * * cd /home/scalp/water-meter-ai-not-on-the-edge && \
+  python cron_ha.py >> /var/log/water_meter.log 2>&1
+```
+
+Or via systemd timer:
+
+Create `/etc/systemd/system/water-meter.service`:
+```ini
+[Unit]
+Description=Water Meter Reader
+After=network.target
+
+[Service]
+Type=oneshot
+User=meter
+WorkingDirectory=/home/scalp/water-meter-ai-not-on-the-edge
+Environment="MQTT_BROKER=192.168.1.10"
+Environment="IMAGE_URL=http://web.lan/watermeter_images/latest.jpg"
+Environment="SDCARD_DIR=/home/scalp/water-meter-ai-not-on-the-edge/sdcard"
+ExecStart=/usr/bin/python3 /home/scalp/water-meter-ai-not-on-the-edge/cron_ha.py
+StandardOutput=journal
+StandardError=journal
+```
+
+Create `/etc/systemd/system/water-meter.timer`:
+```ini
+[Unit]
+Description=Water Meter Reader Timer
+Requires=water-meter.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable and start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable water-meter.timer
+sudo systemctl start water-meter.timer
+sudo systemctl status water-meter.timer
+
+# View logs
+sudo journalctl -u water-meter.service -f
+```
+
+**Home Assistant Automation Example:**
+
+Create a template sensor for daily delta:
+```yaml
+# configuration.yaml
+template:
+  - sensor:
+      - name: "Water Meter Daily Delta"
+        unique_id: water_meter_daily_delta
+        unit_of_measurement: "m³"
+        state: >
+          {% set today = now().date() %}
+          {% set sensor_history = state_attr('sensor.water_meter', 'history') %}
+          {# Simple delta: current - midnight reading #}
+          {{ (states('sensor.water_meter') | float - 0.0) | round(3) }}
+```
+
+Or trigger automations on readings:
+```yaml
+automation:
+  - alias: "Alert if water meter jumps"
+    trigger:
+      platform: state
+      entity_id: sensor.water_meter
+    condition:
+      template: "{{ (trigger.to_state.state | float - trigger.from_state.state | float) > 10 }}"
+    action:
+      service: notify.mobile_app_phone
+      data:
+        message: "⚠️ Water meter jumped by {{ (trigger.to_state.state | float - trigger.from_state.state | float) | round(2) }} m³"
+```
+
+**Troubleshooting cron_ha.py:**
+
+1. **"Failed to connect to MQTT broker"**
+   - Verify broker is running: `nc -zv 192.168.1.10 1883`
+   - Check firewall allows port 1883
+   - Verify `MQTT_BROKER` env var is correct
+
+2. **"Failed to download image"**
+   - Test URL: `curl http://web.lan/watermeter_images/latest.jpg > /tmp/test.jpg`
+   - Check URL is accessible from the machine running cron_ha.py
+   - Verify image is valid JPEG/PNG
+
+3. **"meter_reader.py failed"**
+   - Run meter_reader.py directly to debug
+   - Check `--debug-dir` output from cron_ha.py logs
+   - Verify sdcard/config/ has valid config.ini and models
+
+4. **Entity not appearing in Home Assistant**
+   - Check MQTT integration is enabled in HA
+   - Verify `discovery_prefix` matches (default: `homeassistant`)
+   - Check HA logs for MQTT discovery errors
+   - Manually check MQTT topic: `mosquitto_sub -h 192.168.1.10 -t "homeassistant/#"`
+
+### Example 4: Integration with Home Assistant / InfluxDB
 
 ```bash
 # Cron job to read meter every hour
@@ -428,7 +732,7 @@ for sequence_name, reading in data.items():
         print(f"{sequence_name}: ERROR – {reading['error']}")
 ```
 
-### Example 4: Proxmox LXC Container
+### Example 6: Proxmox LXC Container
 
 ```bash
 # Inside Proxmox LXC (Debian 12):
