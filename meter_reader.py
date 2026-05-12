@@ -178,11 +178,8 @@ class Config:
     postprocessing: Dict[str, PostProcessingNumber] = field(default_factory=dict)
     pre_value_use: bool = False
     error_message: bool = True
-<<<<<<< meter_reader.py.mine
     prevalue: Optional[PreValue] = None
-=======
     logging: LoggingConfig = field(default_factory=LoggingConfig)
->>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
 
 
 # ===========================================================================
@@ -1224,11 +1221,8 @@ def run(
     config_path: str,
     sdcard_dir: str,
     debug_dir: Optional[str] = None,
-<<<<<<< meter_reader.py.mine
     prevalue_path: Optional[str] = None,
-=======
     log_samples_dir: Optional[str] = None,
->>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
 ) -> Dict:
     """
     Full pipeline:
@@ -1240,20 +1234,15 @@ def run(
       6. Assemble and return readings
     """
 
-<<<<<<< meter_reader.py.mine
     # 1. Config (also loads prevalue if pre_value_use is enabled)
     if prevalue_path is None:
         prevalue_path = os.path.join(sdcard_dir, "config", "prevalue.ini")
     cfg = parse_config(config_path, sdcard_dir, prevalue_path)
-=======
-    # 1. Config
-    cfg = parse_config(config_path, sdcard_dir)
     
     # Override logging config if --log-samples was provided
     if log_samples_dir:
         cfg.logging.enabled = True
         cfg.logging.save_location = log_samples_dir
->>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
 
     # 2. Image loading + alignment
     image = Image.open(image_path).convert("RGB")
@@ -1403,11 +1392,8 @@ def main() -> None:
         config_path=config_path,
         sdcard_dir=args.sdcard,
         debug_dir=args.debug_dir,
-<<<<<<< meter_reader.py.mine
         prevalue_path=args.prevalue,
-=======
         log_samples_dir=args.log_samples,
->>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
     )
 
     print(json.dumps(results, indent=2 if args.pretty else None))
