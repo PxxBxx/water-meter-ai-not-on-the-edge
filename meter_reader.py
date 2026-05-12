@@ -101,6 +101,7 @@ class ROI:
     result_float: float = -1.0
     result_klasse: int = -1
     is_reject: bool = False
+    confidence: float = -1.0  # model confidence/probability for the result
     image: Optional[np.ndarray] = None  # resized RGB uint8 (H, W, 3)
 
 
@@ -151,6 +152,13 @@ class PostProcessingNumber:
 
 
 @dataclass
+class PreValue:
+    """Previous meter reading with timestamp."""
+    timestamp: str = ""
+    value: float = -1.0
+
+
+@dataclass
 class Config:
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     digits: Optional[CNNConfig] = None
@@ -158,6 +166,7 @@ class Config:
     postprocessing: Dict[str, PostProcessingNumber] = field(default_factory=dict)
     pre_value_use: bool = False
     error_message: bool = True
+    prevalue: Optional[PreValue] = None
 
 
 # ===========================================================================
@@ -181,7 +190,30 @@ def _parse_kv(line: str) -> Tuple[str, List[str]]:
     return (parts[0] if parts else ""), (parts[1:] if len(parts) > 1 else [])
 
 
-def parse_config(config_path: str, sdcard_dir: str) -> Config:
+def load_prevalue(prevalue_path: str) -> Optional[PreValue]:
+    """Load the previous meter reading from prevalue.ini.
+    Format:
+        Line 1: timestamp (YYYY-MM-DD_HH-MM-SS)
+        Line 2: previous reading value
+    """
+    if not os.path.exists(prevalue_path):
+        return None
+
+    try:
+        with open(prevalue_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(lines) >= 2:
+                return PreValue(
+                    timestamp=lines[0],
+                    value=float(lines[1])
+                )
+    except (ValueError, IOError):
+        pass
+
+    return None
+
+
+def parse_config(config_path: str, sdcard_dir: str, prevalue_path: Optional[str] = None) -> Config:
     """Parse an AI-on-the-edge-device config.ini."""
 
     cfg = Config()
@@ -345,6 +377,11 @@ def parse_config(config_path: str, sdcard_dir: str) -> Config:
     if analog_cfg.groups:
         cfg.analog = analog_cfg
     cfg.postprocessing = pp
+
+    # Load prevalue if available and enabled
+    if cfg.pre_value_use and prevalue_path:
+        cfg.prevalue = load_prevalue(prevalue_path)
+
     return cfg
 
 
@@ -526,27 +563,35 @@ def _run_inference(interp, roi_image: np.ndarray) -> np.ndarray:
     return interp.get_tensor(out_details[0]["index"])[0]  # (N,)
 
 
-def _infer_digit(output: np.ndarray) -> Tuple[int, float]:
-    """Digit model (11 outputs). Class 10 means the digit could not be read (N)."""
-    return int(np.argmax(output)), -1.0
+def _infer_digit(output: np.ndarray) -> Tuple[int, float, float]:
+    """Digit model (11 outputs). Class 10 means the digit could not be read (N).
+    Returns (class, float_result, confidence).
+    """
+    class_idx = int(np.argmax(output))
+    confidence = float(output[class_idx])
+    return class_idx, -1.0, confidence
 
 
-def _infer_analogue(output: np.ndarray, ccw: bool) -> float:
-    """Analogue model (2 outputs). atan2 → 0-1 → scale to 0-10."""
+def _infer_analogue(output: np.ndarray, ccw: bool) -> Tuple[float, float]:
+    """Analogue model (2 outputs). atan2 → 0-1 → scale to 0-10.
+    Returns (result_float, confidence) where confidence is the magnitude of the vector.
+    """
     f1, f2 = float(output[0]), float(output[1])
+    magnitude = math.sqrt(f1**2 + f2**2)  # confidence is signal strength
     angle = math.fmod(math.atan2(f1, f2) / (math.pi * 2) + 2, 1)
     if ccw:
-        return 10.0 - angle * 10.0
-    return angle * 10.0
+        return 10.0 - angle * 10.0, magnitude
+    return angle * 10.0, magnitude
 
 
 def _infer_doublehybrid10(
     output: np.ndarray, ccw: bool, good_threshold: float
-) -> Tuple[float, bool]:
+) -> Tuple[float, bool, float]:
     """
     DoubleHybrid10 model (10 outputs).
     Finds the best class then weights it by adjacent class probabilities
     to get a sub-integer float result.
+    Returns (result, is_reject, confidence) where confidence is the fit value.
     """
     num = int(np.argmax(output))
     np1 = (num + 1) % 10
@@ -570,15 +615,18 @@ def _infer_doublehybrid10(
         result += 10
 
     is_reject = fit < good_threshold
-    return (-1.0 if is_reject else result), is_reject
+    return (-1.0 if is_reject else result), is_reject, fit
 
 
-def _infer_cls100(output: np.ndarray, ccw: bool) -> float:
-    """Digit100 / Analogue100 model (100 outputs). value = argmax / 10."""
+def _infer_cls100(output: np.ndarray, ccw: bool) -> Tuple[float, float]:
+    """Digit100 / Analogue100 model (100 outputs). value = argmax / 10.
+    Returns (result_float, confidence) where confidence is the output value at argmax.
+    """
     num = int(np.argmax(output))
+    confidence = float(output[num])
     if ccw:
-        return 10.0 - num / 10.0
-    return num / 10.0
+        return 10.0 - num / 10.0, confidence
+    return num / 10.0, confidence
 
 
 def run_cnn_for_group(
@@ -595,20 +643,20 @@ def run_cnn_for_group(
         output = _run_inference(interp, roi.image)
 
         if cnn_type == CNNType.Digit:
-            roi.result_klasse, roi.result_float = _infer_digit(output)
+            roi.result_klasse, roi.result_float, roi.confidence = _infer_digit(output)
 
         elif cnn_type == CNNType.Analogue:
-            roi.result_float = _infer_analogue(output, roi.ccw)
+            roi.result_float, roi.confidence = _infer_analogue(output, roi.ccw)
             roi.result_klasse = -1
 
         elif cnn_type == CNNType.DoubleHybrid10:
-            roi.result_float, roi.is_reject = _infer_doublehybrid10(
+            roi.result_float, roi.is_reject, roi.confidence = _infer_doublehybrid10(
                 output, roi.ccw, cfg.good_threshold
             )
             roi.result_klasse = -1
 
         elif cnn_type in (CNNType.Digit100, CNNType.Analogue100):
-            roi.result_float = _infer_cls100(output, roi.ccw)
+            roi.result_float, roi.confidence = _infer_cls100(output, roi.ccw)
             roi.result_klasse = -1
 
 
@@ -869,10 +917,71 @@ def _shift_decimal(s: str, shift: int) -> str:
     return s[:new_dot] + "." + s[new_dot:]
 
 
+def _apply_prevalue_correction(raw_value: str, cfg: Config, group_name: str) -> str:
+    """
+    Apply pre-value correction if available.
+    Attempts to fix misread digits by comparing against the previous reading.
+    
+    If the current reading is significantly different from the expected progression
+    (previous + typical daily change), we try to find a similar alternative that
+    differs only by a single digit substitution.
+    """
+    if not cfg.prevalue or cfg.prevalue.value < 0 or "N" in raw_value or "." not in raw_value:
+        return raw_value
+
+    try:
+        current = float(raw_value)
+        previous = cfg.prevalue.value
+        diff = current - previous
+
+        # Normal range: meter typically increases slowly, rarely more than a few hundred liters per reading
+        # If diff is small negative or small positive, accept it
+        if -10 <= diff <= 500:
+            return raw_value
+
+        # If diff is very large or negative (beyond reasonable daily usage),
+        # it likely means a single digit was misread.
+        # Try digit substitutions: for each digit position, try 0-9 and see if
+        # the result is closer to the expected progression.
+
+        best_candidate = raw_value
+        best_distance = abs(diff)
+
+        for pos in range(len(raw_value)):
+            if raw_value[pos] not in "0123456789":
+                continue
+
+            for digit in "0123456789":
+                if digit == raw_value[pos]:
+                    continue
+
+                candidate = raw_value[:pos] + digit + raw_value[pos + 1:]
+                try:
+                    candidate_val = float(candidate)
+                    candidate_diff = candidate_val - previous
+
+                    # Check if this candidate is more reasonable
+                    if -10 <= candidate_diff <= 500:
+                        return candidate
+
+                    # Or if it's closer to the expected range
+                    if abs(candidate_diff) < best_distance:
+                        best_candidate = candidate
+                        best_distance = abs(candidate_diff)
+                except ValueError:
+                    continue
+
+        return best_candidate
+
+    except (ValueError, TypeError):
+        return raw_value
+
+
 def _assemble_reading(cfg: Config, group_name: str) -> Dict:
     """
     Assemble the final reading for one named group (sequence).
     Mirrors the per-number loop in ClassFlowPostProcessing::doFlow().
+    Also includes per-ROI confidence values.
     """
     pp = (
         cfg.postprocessing.get(group_name)
@@ -898,6 +1007,10 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
 
     raw_value = ""
     previous_value = -1  # integer value of the first (most-significant) analog digit
+    confidences: List[float] = []  # collect confidence values for each ROI
+
+    # Collect ROIs in order for confidence tracking
+    all_rois: List[ROI] = []
 
     # Step 1 – Analog readout
     if analog_idx >= 0 and cfg.analog is not None:
@@ -910,6 +1023,8 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
         raw_value = analog_raw
         if raw_value and raw_value[0].isdigit():
             previous_value = int(raw_value[0])
+        if cfg.analog.groups[analog_idx].rois:
+            all_rois.extend(cfg.analog.groups[analog_idx].rois)
 
     # Step 2 – Digit readout (prepended before analog)
     if digit_idx >= 0 and cfg.digits is not None:
@@ -942,9 +1057,19 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
                 previous_value,
             )
             raw_value = digit_raw
+        if cfg.digits.groups[digit_idx].rois:
+            all_rois.extend(cfg.digits.groups[digit_idx].rois)
+
+    # Collect confidences from all ROIs
+    for roi in all_rois:
+        if roi.confidence >= 0:
+            confidences.append(roi.confidence)
 
     if not raw_value:
-        return {"raw": "", "value": None, "error": "No ROIs configured"}
+        result = {"raw": "", "value": None, "error": "No ROIs configured"}
+        if confidences:
+            result["confidence"] = confidences
+        return result
 
     # Step 3 – Decimal shift
     raw_value = _shift_decimal(raw_value, pp.decimal_shift)
@@ -956,7 +1081,10 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
 
     # Step 5 – Handle unresolved N
     if "N" in raw_value:
-        return {"raw": raw_value, "value": None, "error": "Unresolved digit (N)"}
+        result = {"raw": raw_value, "value": None, "error": "Unresolved digit (N)"}
+        if confidences:
+            result["confidence"] = confidences
+        return result
 
     # Step 6 – Strip leading zeros
     value_str = raw_value
@@ -966,9 +1094,29 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
     try:
         float(value_str)  # validate
     except ValueError:
-        return {"raw": raw_value, "value": None, "error": f"Cannot parse: {value_str}"}
+        result = {"raw": raw_value, "value": None, "error": f"Cannot parse: {value_str}"}
+        if confidences:
+            result["confidence"] = confidences
+        return result
 
-    return {"raw": raw_value, "value": value_str, "error": "no error"}
+    # Apply pre-value correction if enabled and available
+    if cfg.pre_value_use and cfg.prevalue:
+        corrected_value = _apply_prevalue_correction(value_str, cfg, group_name)
+        if corrected_value != value_str:
+            result = {
+                "raw": raw_value,
+                "value": corrected_value,
+                "error": "no error",
+                "note": f"Corrected from {value_str} based on previous reading {cfg.prevalue.value}"
+            }
+            if confidences:
+                result["confidence"] = confidences
+            return result
+
+    result = {"raw": raw_value, "value": value_str, "error": "no error"}
+    if confidences:
+        result["confidence"] = confidences
+    return result
 
 
 # ===========================================================================
@@ -990,18 +1138,21 @@ def run(
     config_path: str,
     sdcard_dir: str,
     debug_dir: Optional[str] = None,
+    prevalue_path: Optional[str] = None,
 ) -> Dict:
     """
     Full pipeline:
-      1. Parse config.ini
+      1. Parse config.ini and load prevalue.ini if available
       2. Load and align the image
       3. Load TFLite models, detect CNN types
       4. Extract ROI sub-images and run inference
       5. Assemble and return readings
     """
 
-    # 1. Config
-    cfg = parse_config(config_path, sdcard_dir)
+    # 1. Config (also loads prevalue if pre_value_use is enabled)
+    if prevalue_path is None:
+        prevalue_path = os.path.join(sdcard_dir, "config", "prevalue.ini")
+    cfg = parse_config(config_path, sdcard_dir, prevalue_path)
 
     # 2. Image loading + alignment
     image = Image.open(image_path).convert("RGB")
@@ -1106,6 +1257,13 @@ def main() -> None:
         help="Save intermediate images (aligned frame, cropped ROIs) here."
     )
     parser.add_argument(
+        "--prevalue", default=None, metavar="PATH",
+        help=(
+            "Path to prevalue.ini (previous meter reading). "
+            "Default: <sdcard>/config/prevalue.ini"
+        ),
+    )
+    parser.add_argument(
         "--pretty", action="store_true",
         help="Pretty-print JSON output."
     )
@@ -1126,6 +1284,7 @@ def main() -> None:
         config_path=config_path,
         sdcard_dir=args.sdcard,
         debug_dir=args.debug_dir,
+        prevalue_path=args.prevalue,
     )
 
     print(json.dumps(results, indent=2 if args.pretty else None))
