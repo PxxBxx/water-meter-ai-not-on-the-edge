@@ -27,8 +27,10 @@ import os
 import re
 import sys
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -77,6 +79,44 @@ try:
     _HAS_CV2 = True
 except ImportError:
     _HAS_CV2 = False
+
+
+# ---------------------------------------------------------------------------
+# Image loading helpers
+# ---------------------------------------------------------------------------
+
+def _is_url(source: str) -> bool:
+    """Check if source is a URL (http://, https://, etc.)."""
+    return source.startswith(("http://", "https://", "ftp://"))
+
+
+def _load_image(source: str) -> Image.Image:
+    """
+    Load an image from either a URL or a file path.
+    
+    Args:
+        source: Either a URL (http://, https://) or a local file path.
+    
+    Returns:
+        PIL Image in RGB mode.
+    
+    Raises:
+        FileNotFoundError: if the local file doesn't exist.
+        urllib.error.URLError: if the URL fails.
+        PIL.UnidentifiedImageError: if the image format is not recognized.
+    """
+    if _is_url(source):
+        # Download from URL
+        with urllib.request.urlopen(source) as response:
+            image_data = response.read()
+        image = Image.open(BytesIO(image_data))
+    else:
+        # Load from file path
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"Image not found: {source}")
+        image = Image.open(source)
+    
+    return image.convert("RGB")
 
 
 # ===========================================================================
@@ -937,98 +977,170 @@ def _shift_decimal(s: str, shift: int) -> str:
     return s[:new_dot] + "." + s[new_dot:]
 
 
+# ---------------------------------------------------------------------------
+# Digit ambiguity correction
+# ---------------------------------------------------------------------------
+
+# Digits that are commonly misread as one another by the CNN models.
+COMMON_CONFUSIONS: Dict[str, List[str]] = {
+    "4": ["9"],
+    "9": ["4"],
+    "8": ["6", "3"],
+    "6": ["8"],
+    "3": ["8"],
+    "1": ["7"],
+    "7": ["1"],
+}
+
+# Acceptable meter progression per reading cycle.
+_PLAUSIBLE_MIN = -10.0    # small negative margin for rounding jitter
+_PLAUSIBLE_MAX = 1000.0    # max realistic increase between readings
+
+
+def _is_plausible_diff(diff: float) -> bool:
+    return _PLAUSIBLE_MIN <= diff <= _PLAUSIBLE_MAX
+
+
+def _pick_best_candidate(candidates: List[str], previous_value: float) -> Optional[str]:
+    """
+    From a list of candidate strings return the best one:
+    - the first candidate whose value is within the plausible range, or
+    - the candidate numerically closest to the previous reading otherwise.
+    """
+    best: Optional[str] = None
+    best_dist = float("inf")
+    for c in candidates:
+        try:
+            val = float(c)
+        except ValueError:
+            continue
+        diff = val - previous_value
+        if _is_plausible_diff(diff):
+            return c
+        dist = abs(diff)
+        if dist < best_dist:
+            best = c
+            best_dist = dist
+    return best
+
+
+def _confusion_candidates(raw_value: str) -> List[str]:
+    """
+    Generate candidates by substituting visually-confused digits (one at a
+    time) according to COMMON_CONFUSIONS.  Only numeric positions are mutated.
+    """
+    candidates: List[str] = []
+    for i, ch in enumerate(raw_value):
+        if ch in COMMON_CONFUSIONS:
+            for alt in COMMON_CONFUSIONS[ch]:
+                candidates.append(raw_value[:i] + alt + raw_value[i + 1:])
+    return candidates
+
+
+def _all_digit_candidates(raw_value: str) -> List[str]:
+    """
+    Generate candidates by substituting any single digit position with 0-9.
+    Brute-force fallback used when targeted confusion substitution fails.
+    """
+    candidates: List[str] = []
+    for i, ch in enumerate(raw_value):
+        if ch in "0123456789":
+            for d in "0123456789":
+                if d != ch:
+                    candidates.append(raw_value[:i] + d + raw_value[i + 1:])
+    return candidates
+
+
 def _resolve_n_digits(raw_value: str, previous_value: float) -> Optional[str]:
     """
-    Try to resolve 'N' (unrecognised) digits using the previous meter reading.
-    Tries all digit combinations (0-9) for each N position and returns the
-    first candidate whose value is within a reasonable range of the previous
-    reading.  Falls back to the numerically closest candidate.
-    Returns None when the value cannot be parsed at all.
+    Resolve 'N' (unrecognised) digits and/or fix visually-confused digits
+    using the previous meter reading as a reference.
+
+    Strategy
+    --------
+    Build a per-position alternative list:
+      * N        → all digits 0-9
+      * confused → original digit + COMMON_CONFUSIONS alternatives
+    Take the cartesian product of all mutable positions, score every resulting
+    candidate and return the most plausible one.
+
+    If no N or confused positions exist but the raw value is implausible,
+    fall back to exhaustive single-digit brute-force.
     """
     import itertools
 
-    n_positions = [i for i, c in enumerate(raw_value) if c == "N"]
-    if not n_positions:
-        return raw_value
+    mutable_indices: List[int] = []
+    position_choices: List[List[str]] = []
 
-    best: Optional[str] = None
-    best_dist = float("inf")
+    for i, ch in enumerate(raw_value):
+        if ch == "N":
+            mutable_indices.append(i)
+            position_choices.append(list("0123456789"))
+        elif ch in COMMON_CONFUSIONS:
+            mutable_indices.append(i)
+            position_choices.append([ch] + COMMON_CONFUSIONS[ch])
 
-    for digits in itertools.product("0123456789", repeat=len(n_positions)):
-        candidate = list(raw_value)
-        for pos, digit in zip(n_positions, digits):
-            candidate[pos] = digit
-        candidate_str = "".join(candidate)
+    if not mutable_indices:
+        # Nothing to mutate via N or confusion map – check current plausibility.
         try:
-            val = float(candidate_str)
+            if _is_plausible_diff(float(raw_value) - previous_value):
+                return raw_value
         except ValueError:
-            continue
+            pass
+        # Last resort: single-digit brute-force.
+        return _pick_best_candidate(_all_digit_candidates(raw_value), previous_value)
 
-        diff = val - previous_value
-        if -10 <= diff <= 500:
-            return candidate_str  # first plausible reading wins
-        if abs(diff) < best_dist:
-            best = candidate_str
-            best_dist = abs(diff)
+    base = list(raw_value)
+    candidates: List[str] = []
+    for combo in itertools.product(*position_choices):
+        candidate = base[:]
+        for idx, digit in zip(mutable_indices, combo):
+            candidate[idx] = digit
+        candidate_str = "".join(candidate)
+        if "N" not in candidate_str:
+            candidates.append(candidate_str)
 
-    return best
+    return _pick_best_candidate(candidates, previous_value)
 
 
 def _apply_prevalue_correction(raw_value: str, cfg: Config, group_name: str) -> str:
     """
-    Apply pre-value correction if available.
-    Attempts to fix misread digits by comparing against the previous reading.
-    
-    If the current reading is significantly different from the expected progression
-    (previous + typical daily change), we try to find a similar alternative that
-    differs only by a single digit substitution.
+    Attempt to fix a plausible-but-wrong reading by comparing it against the
+    previous meter value.
+
+    Correction passes (in order):
+      1. COMMON_CONFUSIONS substitutions  – targeted, single-position mutations
+         of digits that the model commonly confuses.
+      2. Brute-force single-digit substitution – try every digit at every
+         position as a fallback.
+
+    Accepts the first candidate that falls within the plausible progression
+    range; otherwise keeps the original.
     """
     if not cfg.prevalue or cfg.prevalue.value < 0 or "N" in raw_value or "." not in raw_value:
         return raw_value
 
     try:
-        current = float(raw_value)
         previous = cfg.prevalue.value
-        diff = current - previous
+        diff = float(raw_value) - previous
+        if _is_plausible_diff(diff):
+            return raw_value  # already fine
 
-        # Normal range: meter typically increases slowly, rarely more than a few hundred liters per reading
-        # If diff is small negative or small positive, accept it
-        if -10 <= diff <= 500:
-            return raw_value
+        # Pass 1 – targeted confusion substitutions
+        best = _pick_best_candidate(_confusion_candidates(raw_value), previous)
+        if best is not None:
+            try:
+                if _is_plausible_diff(float(best) - previous):
+                    return best
+            except ValueError:
+                pass
 
-        # If diff is very large or negative (beyond reasonable daily usage),
-        # it likely means a single digit was misread.
-        # Try digit substitutions: for each digit position, try 0-9 and see if
-        # the result is closer to the expected progression.
+        # Pass 2 – brute-force single-digit substitution
+        best2 = _pick_best_candidate(_all_digit_candidates(raw_value), previous)
+        if best2 is not None:
+            return best2
 
-        best_candidate = raw_value
-        best_distance = abs(diff)
-
-        for pos in range(len(raw_value)):
-            if raw_value[pos] not in "0123456789":
-                continue
-
-            for digit in "0123456789":
-                if digit == raw_value[pos]:
-                    continue
-
-                candidate = raw_value[:pos] + digit + raw_value[pos + 1:]
-                try:
-                    candidate_val = float(candidate)
-                    candidate_diff = candidate_val - previous
-
-                    # Check if this candidate is more reasonable
-                    if -10 <= candidate_diff <= 500:
-                        return candidate
-
-                    # Or if it's closer to the expected range
-                    if abs(candidate_diff) < best_distance:
-                        best_candidate = candidate
-                        best_distance = abs(candidate_diff)
-                except ValueError:
-                    continue
-
-        return best_candidate
+        return raw_value
 
     except (ValueError, TypeError):
         return raw_value
@@ -1293,7 +1405,14 @@ def run(
         cfg.logging.save_location = log_samples_dir
 
     # 2. Image loading + alignment
-    image = Image.open(image_path).convert("RGB")
+    try:
+        image = _load_image(image_path)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Could not load image from {image_path}: {e}", file=sys.stderr)
+        sys.exit(1)
     aligned = align_image(image, cfg.alignment)
 
     if debug_dir:
@@ -1386,8 +1505,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--image", required=True, metavar="PATH",
-        help="Input meter image (JPEG, PNG, …)"
+        "--image", required=True, metavar="PATH_OR_URL",
+        help="Input meter image: local file path (JPEG, PNG, …) or URL (http://, https://)"
     )
     parser.add_argument(
         "--sdcard", default="./sdcard", metavar="DIR",
@@ -1427,7 +1546,8 @@ def main() -> None:
 
     config_path = args.config or os.path.join(args.sdcard, "config", "config.ini")
 
-    if not os.path.exists(args.image):
+    # Validate image source (URL or file path)
+    if not _is_url(args.image) and not os.path.exists(args.image):
         print(f"ERROR: Image not found: {args.image}", file=sys.stderr)
         sys.exit(1)
 
