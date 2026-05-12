@@ -20,11 +20,13 @@ Outputs JSON to stdout, e.g.:
 """
 
 import argparse
+import datetime
 import json
 import math
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -130,6 +132,16 @@ class AlignmentConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """Configuration for ROI sample logging (model training data collection)."""
+    enabled: bool = False
+    save_location: str = ""  # /sdcard/log or similar
+    retention_days: int = 3  # Keep samples for N days
+    selective: Optional[List[str]] = None  # If set, only log these ROI names
+    save_all_files: bool = False  # If True, save all ROIs
+
+
+@dataclass
 class CNNConfig:
     model_file: str = ""
     cnn_type: CNNType = CNNType.AutoDetect
@@ -166,7 +178,11 @@ class Config:
     postprocessing: Dict[str, PostProcessingNumber] = field(default_factory=dict)
     pre_value_use: bool = False
     error_message: bool = True
+<<<<<<< meter_reader.py.mine
     prevalue: Optional[PreValue] = None
+=======
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+>>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
 
 
 # ===========================================================================
@@ -307,8 +323,15 @@ def parse_config(config_path: str, sdcard_dir: str, prevalue_path: Optional[str]
                     target_cfg.model_file = sdcard_path(v0)
                 elif ku == "CNNGOODTHRESHOLD":
                     target_cfg.good_threshold = float(v0) if v0 else 0.5
-                elif ku in ("ROIIMAGESLOCATION", "ROIIMAGESRETENTION"):
-                    pass  # logging config, skip
+                elif ku == "ROIIMAGESLOCATION":
+                    cfg.logging.save_location = sdcard_path(v0)
+                    cfg.logging.enabled = True
+                elif ku == "ROIIMAGESRETENTION":
+                    cfg.logging.retention_days = int(v0) if v0 else 3
+                elif ku == "LOGIMAGESELECT":
+                    cfg.logging.selective = [s.strip() for s in v0.split(",")] if v0 else None
+                elif ku == "SAVEALLFILES":
+                    cfg.logging.save_all_files = _to_bool(v0)
                 else:
                     # ROI line: name x y dx dy [ccw]
                     # The key is the ROI name (e.g. "main.dig1")
@@ -1120,6 +1143,69 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
 
 
 # ===========================================================================
+# ROI sample logging (training data collection)
+# ===========================================================================
+
+def _cleanup_old_samples(log_dir: str, retention_days: int) -> None:
+    """Delete ROI sample files older than retention_days."""
+    if not os.path.exists(log_dir):
+        return
+    
+    cutoff_time = time.time() - (retention_days * 86400)
+    try:
+        for filename in os.listdir(log_dir):
+            filepath = os.path.join(log_dir, filename)
+            if os.path.isfile(filepath) and filepath.endswith('.jpg'):
+                if os.path.getmtime(filepath) < cutoff_time:
+                    os.remove(filepath)
+    except (OSError, IOError) as e:
+        print(f"WARNING: Could not clean up old samples: {e}", file=sys.stderr)
+
+
+def _should_log_roi(roi_name: str, selective: Optional[List[str]]) -> bool:
+    """Check if ROI should be logged based on selective filter."""
+    if selective is None:
+        return True
+    # Extract the short name (e.g. "dig1" from "main.dig1")
+    short_name = roi_name.split(".")[-1] if "." in roi_name else roi_name
+    return short_name in selective or roi_name in selective
+
+
+def _save_roi_sample(
+    roi: ROI,
+    group_name: str,
+    cnn_type: CNNType,
+    log_dir: str,
+    selective: Optional[List[str]] = None,
+) -> None:
+    """Save a cropped ROI image with its inference result in the filename."""
+    if roi.image is None or not _should_log_roi(roi.name, selective):
+        return
+    
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Format: {group}_{roi_name}_{result}_{timestamp}.jpg
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if cnn_type == CNNType.Digit:
+        result_str = str(roi.result_klasse) if roi.result_klasse >= 0 else "N"
+    else:
+        # Analogue / Hybrid / 100-class models
+        if roi.result_float >= 0:
+            result_str = f"{roi.result_float:.2f}".replace(".", "_")
+        else:
+            result_str = "N"
+    
+    filename = f"{group_name}_{roi.name.split('.')[-1]}_{result_str}_{timestamp}.jpg"
+    filepath = os.path.join(log_dir, filename)
+    
+    try:
+        Image.fromarray(roi.image).save(filepath)
+    except (OSError, IOError) as e:
+        print(f"WARNING: Could not save ROI sample: {e}", file=sys.stderr)
+
+
+# ===========================================================================
 # Main pipeline
 # ===========================================================================
 
@@ -1138,7 +1224,11 @@ def run(
     config_path: str,
     sdcard_dir: str,
     debug_dir: Optional[str] = None,
+<<<<<<< meter_reader.py.mine
     prevalue_path: Optional[str] = None,
+=======
+    log_samples_dir: Optional[str] = None,
+>>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
 ) -> Dict:
     """
     Full pipeline:
@@ -1146,13 +1236,24 @@ def run(
       2. Load and align the image
       3. Load TFLite models, detect CNN types
       4. Extract ROI sub-images and run inference
-      5. Assemble and return readings
+      5. Optionally save ROI samples for training
+      6. Assemble and return readings
     """
 
+<<<<<<< meter_reader.py.mine
     # 1. Config (also loads prevalue if pre_value_use is enabled)
     if prevalue_path is None:
         prevalue_path = os.path.join(sdcard_dir, "config", "prevalue.ini")
     cfg = parse_config(config_path, sdcard_dir, prevalue_path)
+=======
+    # 1. Config
+    cfg = parse_config(config_path, sdcard_dir)
+    
+    # Override logging config if --log-samples was provided
+    if log_samples_dir:
+        cfg.logging.enabled = True
+        cfg.logging.save_location = log_samples_dir
+>>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
 
     # 2. Image loading + alignment
     image = Image.open(image_path).convert("RGB")
@@ -1200,6 +1301,11 @@ def run(
                             os.path.join(debug_dir, f"digit_{roi.name}.jpg")
                         )
             run_cnn_for_group(cfg.digits, grp, digit_type, digit_interp)
+            
+            # Log ROI samples if enabled
+            if cfg.logging.enabled and cfg.logging.save_location:
+                for roi in grp.rois:
+                    _save_roi_sample(roi, grp.name, digit_type, cfg.logging.save_location, cfg.logging.selective)
 
     if cfg.analog and analog_interp and analog_type is not None:
         for grp in cfg.analog.groups:
@@ -1211,6 +1317,15 @@ def run(
                             os.path.join(debug_dir, f"analog_{roi.name}.jpg")
                         )
             run_cnn_for_group(cfg.analog, grp, analog_type, analog_interp)
+            
+            # Log ROI samples if enabled
+            if cfg.logging.enabled and cfg.logging.save_location:
+                for roi in grp.rois:
+                    _save_roi_sample(roi, grp.name, analog_type, cfg.logging.save_location, cfg.logging.selective)
+
+    # Cleanup old samples if logging is enabled
+    if cfg.logging.enabled and cfg.logging.save_location:
+        _cleanup_old_samples(cfg.logging.save_location, cfg.logging.retention_days)
 
     # 5. Assemble readings
     results: Dict = {}
@@ -1267,6 +1382,10 @@ def main() -> None:
         "--pretty", action="store_true",
         help="Pretty-print JSON output."
     )
+    parser.add_argument(
+        "--log-samples", default=None, metavar="DIR",
+        help="Enable ROI sample logging for model retraining. Saves cropped ROI images here."
+    )
     args = parser.parse_args()
 
     config_path = args.config or os.path.join(args.sdcard, "config", "config.ini")
@@ -1284,7 +1403,11 @@ def main() -> None:
         config_path=config_path,
         sdcard_dir=args.sdcard,
         debug_dir=args.debug_dir,
+<<<<<<< meter_reader.py.mine
         prevalue_path=args.prevalue,
+=======
+        log_samples_dir=args.log_samples,
+>>>>>>> ../AI-on-the-edge/AI-on-the-edge-device/meter-reader/meter_reader.py
     )
 
     print(json.dumps(results, indent=2 if args.pretty else None))
