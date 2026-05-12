@@ -937,6 +937,43 @@ def _shift_decimal(s: str, shift: int) -> str:
     return s[:new_dot] + "." + s[new_dot:]
 
 
+def _resolve_n_digits(raw_value: str, previous_value: float) -> Optional[str]:
+    """
+    Try to resolve 'N' (unrecognised) digits using the previous meter reading.
+    Tries all digit combinations (0-9) for each N position and returns the
+    first candidate whose value is within a reasonable range of the previous
+    reading.  Falls back to the numerically closest candidate.
+    Returns None when the value cannot be parsed at all.
+    """
+    import itertools
+
+    n_positions = [i for i, c in enumerate(raw_value) if c == "N"]
+    if not n_positions:
+        return raw_value
+
+    best: Optional[str] = None
+    best_dist = float("inf")
+
+    for digits in itertools.product("0123456789", repeat=len(n_positions)):
+        candidate = list(raw_value)
+        for pos, digit in zip(n_positions, digits):
+            candidate[pos] = digit
+        candidate_str = "".join(candidate)
+        try:
+            val = float(candidate_str)
+        except ValueError:
+            continue
+
+        diff = val - previous_value
+        if -10 <= diff <= 500:
+            return candidate_str  # first plausible reading wins
+        if abs(diff) < best_dist:
+            best = candidate_str
+            best_dist = abs(diff)
+
+    return best
+
+
 def _apply_prevalue_correction(raw_value: str, cfg: Config, group_name: str) -> str:
     """
     Apply pre-value correction if available.
@@ -1101,10 +1138,21 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
 
     # Step 5 – Handle unresolved N
     if "N" in raw_value:
-        result = {"raw": raw_value, "value": None, "error": "Unresolved digit (N)"}
-        if confidences:
-            result["confidence"] = confidences
-        return result
+        # Attempt to fill N positions using the previous meter reading.
+        if cfg.pre_value_use and cfg.prevalue and cfg.prevalue.value >= 0:
+            fixed = _resolve_n_digits(raw_value, cfg.prevalue.value)
+            if fixed is not None and "N" not in fixed:
+                raw_value = fixed  # resolved – continue with normal post-processing
+            else:
+                result = {"raw": raw_value, "value": None, "error": "Unresolved digit (N)"}
+                if confidences:
+                    result["confidence"] = confidences
+                return result
+        else:
+            result = {"raw": raw_value, "value": None, "error": "Unresolved digit (N)"}
+            if confidences:
+                result["confidence"] = confidences
+            return result
 
     # Step 6 – Strip leading zeros
     value_str = raw_value
