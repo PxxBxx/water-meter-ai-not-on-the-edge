@@ -266,6 +266,20 @@ def load_prevalue(prevalue_path: str) -> Optional[PreValue]:
     return None
 
 
+def save_prevalue(prevalue_path: str, value: float) -> bool:
+    """Save the current meter reading to prevalue.ini.
+    Creates the file if it doesn't exist. Updates with new timestamp and value.
+    """
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        with open(prevalue_path, "w", encoding="utf-8") as f:
+            f.write(f"{timestamp}\n{value}\n")
+        return True
+    except IOError:
+        return False
+
+
 def parse_config(config_path: str, sdcard_dir: str, prevalue_path: Optional[str] = None) -> Config:
     """Parse an AI-on-the-edge-device config.ini."""
 
@@ -545,6 +559,34 @@ def align_image(image: Image.Image, alignment: AlignmentConfig) -> Image.Image:
     h, w = img_np.shape[:2]
     aligned_np = cv2.warpAffine(img_np, M, (w, h), flags=cv2.INTER_LINEAR)
     return Image.fromarray(aligned_np)
+
+
+# ===========================================================================
+# Autotune (contrast enhancement)
+# ===========================================================================
+
+def autotune_image(image: Image.Image) -> Image.Image:
+    """
+    Enhance contrast on the aligned image before ROI extraction.
+
+    Steps:
+      1. Convert to grayscale to remove color variation
+      2. Apply CLAHE (Contrast Limited Adaptive Histogram Equalisation) via
+         OpenCV for localised contrast boost – falls back to PIL autocontrast
+         if OpenCV is unavailable
+      3. Convert back to RGB so the rest of the pipeline is unchanged
+    """
+    if _HAS_CV2:
+        gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(rgb)
+    else:
+        from PIL import ImageOps
+        gray = image.convert("L")
+        equalized = ImageOps.autocontrast(gray)
+        return equalized.convert("RGB")
 
 
 # ===========================================================================
@@ -993,15 +1035,28 @@ COMMON_CONFUSIONS: Dict[str, List[str]] = {
 }
 
 # Acceptable meter progression per reading cycle.
-_PLAUSIBLE_MIN = -10.0    # small negative margin for rounding jitter
-_PLAUSIBLE_MAX = 1000.0    # max realistic increase between readings
+_PLAUSIBLE_MIN = -1.0    # small negative margin for rounding jitter
+_MAX_FLOW_RATE = 2.5      # m³ per hour max realistic flow
 
 
-def _is_plausible_diff(diff: float) -> bool:
-    return _PLAUSIBLE_MIN <= diff <= _PLAUSIBLE_MAX
+def _calculate_max_plausible(prevalue_timestamp: str) -> float:
+    """Calculate max plausible increase based on time elapsed and flow rate."""
+    try:
+        prev_time = datetime.datetime.strptime(prevalue_timestamp, "%Y-%m-%d_%H-%M-%S")
+        elapsed = (datetime.datetime.now() - prev_time).total_seconds() / 3600.0
+        return max(elapsed, 1.0) * _MAX_FLOW_RATE
+    except (ValueError, TypeError):
+        return 500.0
 
 
-def _pick_best_candidate(candidates: List[str], previous_value: float) -> Optional[str]:
+def _is_plausible_diff(diff: float, max_plausible: Optional[float] = None) -> bool:
+    """Check if a meter reading difference is plausible."""
+    if max_plausible is None:
+        max_plausible = 10.0
+    return _PLAUSIBLE_MIN <= diff <= max_plausible
+
+
+def _pick_best_candidate(candidates: List[str], previous_value: float, max_plausible: Optional[float] = None) -> Optional[str]:
     """
     From a list of candidate strings return the best one:
     - the first candidate whose value is within the plausible range, or
@@ -1015,7 +1070,7 @@ def _pick_best_candidate(candidates: List[str], previous_value: float) -> Option
         except ValueError:
             continue
         diff = val - previous_value
-        if _is_plausible_diff(diff):
+        if _is_plausible_diff(diff, max_plausible):
             return c
         dist = abs(diff)
         if dist < best_dist:
@@ -1051,7 +1106,7 @@ def _all_digit_candidates(raw_value: str) -> List[str]:
     return candidates
 
 
-def _resolve_n_digits(raw_value: str, previous_value: float) -> Optional[str]:
+def _resolve_n_digits(raw_value: str, previous_value: float, max_plausible: Optional[float] = None) -> Optional[str]:
     """
     Resolve 'N' (unrecognised) digits and/or fix visually-confused digits
     using the previous meter reading as a reference.
@@ -1083,12 +1138,12 @@ def _resolve_n_digits(raw_value: str, previous_value: float) -> Optional[str]:
     if not mutable_indices:
         # Nothing to mutate via N or confusion map – check current plausibility.
         try:
-            if _is_plausible_diff(float(raw_value) - previous_value):
+            if _is_plausible_diff(float(raw_value) - previous_value, max_plausible):
                 return raw_value
         except ValueError:
             pass
         # Last resort: single-digit brute-force.
-        return _pick_best_candidate(_all_digit_candidates(raw_value), previous_value)
+        return _pick_best_candidate(_all_digit_candidates(raw_value), previous_value, max_plausible)
 
     base = list(raw_value)
     candidates: List[str] = []
@@ -1100,7 +1155,7 @@ def _resolve_n_digits(raw_value: str, previous_value: float) -> Optional[str]:
         if "N" not in candidate_str:
             candidates.append(candidate_str)
 
-    return _pick_best_candidate(candidates, previous_value)
+    return _pick_best_candidate(candidates, previous_value, max_plausible)
 
 
 def _apply_prevalue_correction(raw_value: str, cfg: Config, group_name: str) -> str:
@@ -1122,21 +1177,22 @@ def _apply_prevalue_correction(raw_value: str, cfg: Config, group_name: str) -> 
 
     try:
         previous = cfg.prevalue.value
+        max_plausible = _calculate_max_plausible(cfg.prevalue.timestamp)
         diff = float(raw_value) - previous
-        if _is_plausible_diff(diff):
+        if _is_plausible_diff(diff, max_plausible):
             return raw_value  # already fine
 
         # Pass 1 – targeted confusion substitutions
-        best = _pick_best_candidate(_confusion_candidates(raw_value), previous)
+        best = _pick_best_candidate(_confusion_candidates(raw_value), previous, max_plausible)
         if best is not None:
             try:
-                if _is_plausible_diff(float(best) - previous):
+                if _is_plausible_diff(float(best) - previous, max_plausible):
                     return best
             except ValueError:
                 pass
 
         # Pass 2 – brute-force single-digit substitution
-        best2 = _pick_best_candidate(_all_digit_candidates(raw_value), previous)
+        best2 = _pick_best_candidate(_all_digit_candidates(raw_value), previous, max_plausible)
         if best2 is not None:
             return best2
 
@@ -1252,7 +1308,8 @@ def _assemble_reading(cfg: Config, group_name: str) -> Dict:
     if "N" in raw_value:
         # Attempt to fill N positions using the previous meter reading.
         if cfg.pre_value_use and cfg.prevalue and cfg.prevalue.value >= 0:
-            fixed = _resolve_n_digits(raw_value, cfg.prevalue.value)
+            max_plausible = _calculate_max_plausible(cfg.prevalue.timestamp)
+            fixed = _resolve_n_digits(raw_value, cfg.prevalue.value, max_plausible)
             if fixed is not None and "N" not in fixed:
                 raw_value = fixed  # resolved – continue with normal post-processing
             else:
@@ -1383,6 +1440,8 @@ def run(
     debug_dir: Optional[str] = None,
     prevalue_path: Optional[str] = None,
     log_samples_dir: Optional[str] = None,
+    dry_run: bool = False,
+    autotune: bool = False,
 ) -> Dict:
     """
     Full pipeline:
@@ -1392,6 +1451,10 @@ def run(
       4. Extract ROI sub-images and run inference
       5. Optionally save ROI samples for training
       6. Assemble and return readings
+
+    Args:
+        dry_run: If True, do not update prevalue.ini
+        autotune: If True, apply grayscale + CLAHE contrast enhancement after alignment
     """
 
     # 1. Config (also loads prevalue if pre_value_use is enabled)
@@ -1414,6 +1477,9 @@ def run(
         print(f"ERROR: Could not load image from {image_path}: {e}", file=sys.stderr)
         sys.exit(1)
     aligned = align_image(image, cfg.alignment)
+
+    if autotune:
+        aligned = autotune_image(aligned)
 
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -1488,6 +1554,20 @@ def run(
     for name in _all_group_names(cfg):
         results[name] = _assemble_reading(cfg, name)
 
+    # 6. Update prevalue.ini with successful reading(s) for next time (unless dry_run)
+    if not dry_run and prevalue_path and cfg.pre_value_use:
+        for name, reading in results.items():
+            if isinstance(reading, dict) and reading.get("error") == "no error":
+                value = reading.get("value")
+                if value is not None:
+                    try:
+                        float_value = float(value)
+                        if save_prevalue(prevalue_path, float_value):
+                            print(f"Updated prevalue to {float_value}", file=sys.stderr)
+                        break  # Save the first successful reading group
+                    except ValueError:
+                        pass
+
     return results
 
 
@@ -1542,6 +1622,14 @@ def main() -> None:
         "--log-samples", default=None, metavar="DIR",
         help="Enable ROI sample logging for model retraining. Saves cropped ROI images here."
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Run inference but do not update prevalue.ini."
+    )
+    parser.add_argument(
+        "--autotune", action="store_true",
+        help="Apply grayscale conversion and CLAHE contrast enhancement after alignment."
+    )
     args = parser.parse_args()
 
     config_path = args.config or os.path.join(args.sdcard, "config", "config.ini")
@@ -1562,6 +1650,8 @@ def main() -> None:
         debug_dir=args.debug_dir,
         prevalue_path=args.prevalue,
         log_samples_dir=args.log_samples,
+        dry_run=args.dry_run,
+        autotune=args.autotune,
     )
 
     print(json.dumps(results, indent=2 if args.pretty else None))
